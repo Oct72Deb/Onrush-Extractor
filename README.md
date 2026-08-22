@@ -44,12 +44,13 @@ Your folder structure should look like this after applying the files:
 ## ⚙️ Configuration & Usage
 
 1. Open the `.py` script file in any text editor of your choice.
-2. Update the configuration paths inside the script:
-   - Point it to the directory containing your `.dar` files.
-   - Point it to your `.ndx` index file.
+2. **Configure your paths:** Go directly to **line 286** (at the very end of the file), or press `Ctrl + F` and search for `# .dat Path`. 
+   Here, you need to update the path variables to point to:
+   - **Your folder containing the `.dar` files**
+   - **Your `.ndx` index file**
 3. Run the script via your terminal:
    ```bash
-   python script_name.py
+   python extract_dat_asset.py
    ```
 
 ---
