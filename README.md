@@ -14,13 +14,12 @@ I am excited to announce that the extraction script is finally up and running! W
 
 Before getting started, make sure you have the following ready:
 
-1. **Python 3.x** installed on your machine.
+1. **[Python 3.x](https://www.python.org/)** installed on your machine.
 2. The `lz4` python library installed:
-
    pip install lz4
 
 3. **Your own legal copy of the game**.
-4. **PKG Extraction Tool** (to unpack your game files initially).
+4. A PKG extraction tool such as **[LibOrbisPkg](https://github.com/maxton/LibOrbisPkg)** (to unpack your PS4 game files initially).
 
 ---
 
@@ -46,6 +45,8 @@ Your folder structure should look like this after applying the files:
 ├── 📄 sce_discmap.plt
 └── 📄 sce_discmap_patch.plt
 
+---
+
 ## ⚙️ Configuration & Usage
 
 1. Open the Python script in any text editor of your choice.
@@ -60,6 +61,7 @@ Your folder structure should look like this after applying the files:
 
 python extract_dat_asset.py
 
+---
 
 ## 🤝 Contributing & Community
 
