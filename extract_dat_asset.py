@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-Reproduit (offline) le pipeline de lecture d'assets vu dans datPath() / FUN_01616f80.
+Recreates (offline) the asset reading pipeline seen in datPath() / FUN_01616f80.
 
-Pipeline confirmé par le reverse (voir datPath.c, gameLoader.c, deferencIndex) :
-  1. dat.ndx contient un header (0x30 octets) + 4 tables : ressources (56o/entrée),
-     chunks (12o/entrée), noms de fichiers .dat (8o/entrée), blob de strings.
-  2. Chaque ressource (entrée 56o) donne : nom (+0x00), nom court (+0x10),
+Pipeline confirmed via reverse engineering (see datPath.c, gameLoader.c, deferencIndex):
+  1. dat.ndx contains a header (0x30 bytes) + 4 tables: resources (56b/entry),
+     chunks (12b/entry), .dat filenames (8b/entry), string blob.
+  2. Each resource (56b entry) provides: name (+0x00), short name (+0x10),
      total_size (+0x18), first_chunk_index (+0x1c), base_offset (+0x20).
-  3. Chaque chunk (12o) donne : dat_file_id, offset dans le .dat, taille compressée.
-  4. dat_file_id est un INDEX dans la table de noms, pas un nom littéral.
-  5. Chaque chunk brut est décompressé en LZ4 (FUN_01616f80 == LZ4_decompress_safe),
-     toujours vers exactement `chunk_size` (131072 chez Onrush) octets.
-  6. On concatène les chunks décompressés depuis base_offset jusqu'à total_size.
+  3. Each chunk (12b entry) provides: dat_file_id, offset within the .dat, compressed size.
+  4. dat_file_id is an INDEX in the filename table, not a literal name.
+  5. Each raw chunk is decompressed using LZ4 (FUN_01616f80 == LZ4_decompress_safe),
+     always outputting exactly `chunk_size` (131072 for Onrush) bytes.
+  6. Decompressed chunks are concatenated starting from base_offset up to total_size.
 
-Validé de bout en bout sur de vrais fichiers Onrush (dat.ndx + 59 .dat) :
-texte lisible + vidéo .bk2 extraits avec succès.
+Validated end-to-end on real Onrush files (dat.ndx + 59 .dat files):
+readable text + .bk2 video extracted successfully.
 """
 
 import struct
@@ -28,9 +28,9 @@ except ImportError:
     raise SystemExit("pip install lz4")
 
 
-# --- Table globale de chunks : 12 octets/entrée -----------------------------
+# --- Global Chunk Table: 12 bytes/entry -----------------------------
 CHUNK_ENTRY_SIZE = 12
-CHUNK_ENTRY_FMT = "<III"  # dat_file_id, offset, raw_size (compressée)
+CHUNK_ENTRY_FMT = "<III"  # dat_file_id, offset, raw_size (compressed)
 
 
 @dataclass
@@ -43,10 +43,10 @@ class ChunkEntry:
 @dataclass
 class ResourceDesc:
     name: str
-    first_chunk_index: int   # entrée +0x1c
-    base_offset: int         # entrée +0x20
-    chunk_size: int          # header +0x24 (taille décompressée d'un chunk plein)
-    total_size: int          # entrée +0x18
+    first_chunk_index: int   # entry +0x1c
+    base_offset: int         # entry +0x20
+    chunk_size: int          # header +0x24 (decompressed size of a full chunk)
+    total_size: int          # entry +0x18
 
 
 @dataclass
@@ -77,21 +77,21 @@ class DatNdxHeader:
         return cls(num_resources, num_chunks, chunk_size, num_filenames, string_blob_size)
 
 
-# Offsets confirmés dans chaque entrée de ressource de 56 octets (0x38) :
-RES_OFF_NAME = 0x00             # offset du nom complet dans le blob de strings
-RES_OFF_SHORT_NAME = 0x10       # offset du nom court (sans préfixe namespace)
-RES_OFF_TOTAL_SIZE = 0x18       # confirmé via deferencIndex (vtable+0x30 du stream)
+# Confirmed offsets in each 56-byte (0x38) resource entry:
+RES_OFF_NAME = 0x00             # offset of full name in the string blob
+RES_OFF_SHORT_NAME = 0x10       # offset of short name (without namespace prefix)
+RES_OFF_TOTAL_SIZE = 0x18       # confirmed via deferencIndex (vtable+0x30 from stream)
 RES_OFF_FIRST_CHUNK_IDX = 0x1c  # datPath.c: param_1[3] + 0x1c
 RES_OFF_BASE_OFFSET = 0x20      # datPath.c: param_1[3] + 0x20
 
 
 def load_dat_ndx(dat_ndx_path: Path):
     """
-    Parse dat.ndx en suivant l'ordre de lecture vu dans gameLoader.c :
-    header (0x30) -> table ressources (0x38/entrée) -> table chunks (0xc/entrée)
-    -> table noms (8/entrée) -> string blob brut.
+    Parses dat.ndx following the read order seen in gameLoader.c:
+    header (0x30) -> resource table (0x38/entry) -> chunk table (0xc/entry)
+    -> filename table (8/entry) -> raw string blob.
 
-    Retourne (header, resource_entries_raw, resource_names, chunk_table, filenames, string_blob).
+    Returns (header, resource_entries_raw, resource_names, chunk_table, filenames, string_blob).
     """
     data = dat_ndx_path.read_bytes()
     pos = 0
@@ -147,7 +147,7 @@ def entry_to_resource(entry: bytes, name: str, chunk_size: int) -> ResourceDesc:
 
 
 def parse_dat_index(dat_ndx_path: Path, resource_name: str) -> ResourceDesc:
-    """Cherche une ressource par nom (recherche linéaire) -- pratique pour un test unique."""
+    """Look up a resource by name (linear search) -- useful for single asset testing."""
     header, resource_entries_raw, resource_names, chunk_table, filenames, string_blob = \
         load_dat_ndx(dat_ndx_path)
 
@@ -156,12 +156,14 @@ def parse_dat_index(dat_ndx_path: Path, resource_name: str) -> ResourceDesc:
         if name.lower() == target:
             return entry_to_resource(entry, name, header.chunk_size)
 
-    raise KeyError(f"Ressource '{resource_name}' introuvable dans {dat_ndx_path}")
+    raise KeyError(f"Resource '{resource_name}' not found in {dat_ndx_path}")
 
 
 class DatFileCache:
-    """Garde des handles de fichiers .dat ouverts et lit par seek+read --
-    évite de charger des .dat entiers (potentiellement énormes) en RAM."""
+    """
+    Keeps open file handles for .dat files and performs seek+read operations --
+    prevents loading full (and potentially huge) .dat files into RAM.
+    """
 
     def __init__(self, dat_dir: Path, filenames: list[str]):
         self.dat_dir = dat_dir
@@ -189,7 +191,7 @@ def extract_resource(
     resource: ResourceDesc,
     dat_cache: DatFileCache,
 ) -> bytes:
-    """Reproduit la boucle principale de datPath() : lit + décompresse chunk par chunk."""
+    """Recreates the main loop from datPath(): reads and decompresses chunk by chunk."""
     output = bytearray()
     remaining = resource.total_size
     pos = resource.base_offset
@@ -217,17 +219,21 @@ def extract_resource(
 
 
 def resource_output_path(out_dir: Path, name: str) -> Path:
-    """Convertit un nom du style 'art:animation/foo.mrn' en chemin de fichier,
-    en gardant la hiérarchie (namespace + sous-dossiers)."""
+    """
+    Converts a name formatted like 'art:animation/foo.mrn' into a file path,
+    preserving the folder structure (namespace + subdirectories).
+    """
     clean = name.replace(":", "/")
     parts = [p for p in clean.split("/") if p not in ("", ".")]
     return out_dir.joinpath(*parts)
 
 
 def extract_all(dat_ndx_path: Path, dat_dir: Path, out_dir: Path) -> None:
-    """Extrait TOUTES les ressources de dat.ndx vers out_dir, en préservant
-    l'arborescence de namespaces. Continue sur les erreurs individuelles
-    (log dans failures.txt) plutôt que de tout arrêter."""
+    """
+    Extracts ALL resources from dat.ndx into out_dir, preserving
+    namespace directory trees. Continues execution on individual errors
+    (logs to failures.txt) instead of crashing.
+    """
     header, resource_entries_raw, resource_names, chunk_table, filenames, string_blob = \
         load_dat_ndx(dat_ndx_path)
 
@@ -245,7 +251,7 @@ def extract_all(dat_ndx_path: Path, dat_dir: Path, out_dir: Path) -> None:
         for entry, name in zip(resource_entries_raw, resource_names):
             done += 1
 
-            # namespaces/dossiers purs (pas de contenu réel) -- rien à extraire
+            # Pure namespaces/directories (no actual content) -- nothing to extract
             if name.endswith("/") or name.endswith(":") or name == ".":
                 skipped += 1
                 continue
@@ -277,15 +283,18 @@ def extract_all(dat_ndx_path: Path, dat_dir: Path, out_dir: Path) -> None:
                 print(f"[{done}/{total}] ok={ok} skip={skipped} fail={len(failures)}")
 
     dat_cache.close_all()
-    print(f"\nTerminé. {ok} fichiers extraits, {skipped} ignorés (vides/dossiers), "
-          f"{len(failures)} échecs.")
+    print(f"\nDone. {ok} files extracted, {skipped} skipped (empty/directories), "
+          f"{len(failures)} failed.")
     if failures:
-        print(f"Détail des échecs dans {failures_path}")
+        print(f"Failure details saved to {failures_path}")
 
 
 if __name__ == "__main__":
-    dat_dir = Path(r"E:\DATA\Bureau\Projects\Nanza\Rusher\data")       # .dat Path !
-    dat_ndx_path = Path(r"E:\DATA\Bureau\Projects\Nanza\Rusher\data\dat.ndx") # .ndx Path, Realy important
-    out_dir = Path(r"E:\DATA\Bureau\Projects\Nanza\Rusher\extracted")  # All extracted assets
+    # Define your paths here
+    dat_dir = Path("./data")          # Path to directory containing .dat files
+    dat_ndx_path = Path("./dat.ndx")   # Path to dat.ndx
+    out_dir = Path("./extracted")      # Output directory for extracted assets
+
+    extract_all(dat_ndx_path, dat_dir, out_dir)
 
     extract_all(dat_ndx_path, dat_dir, out_dir)
