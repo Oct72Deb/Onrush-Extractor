@@ -16,6 +16,7 @@ Before getting started, make sure you have the following ready:
 
 1. **[Python 3.x](https://www.python.org/)** installed on your machine.
 2. The `lz4` python library installed:
+   ```bash
    pip install lz4
 
 3. **Your own legal copy of the game**.
@@ -33,6 +34,7 @@ If you currently have version 1.00 and need to update it to 5.00, simply **drag 
 
 Your folder structure should look like this after applying the files:
 
+```text
 📁 YourGameFolder/
 ├── 📁 dat/
 ├── 📁 data/
@@ -44,6 +46,8 @@ Your folder structure should look like this after applying the files:
 ├── 📄 Project.gp4
 ├── 📄 sce_discmap.plt
 └── 📄 sce_discmap_patch.plt
+
+```
 
 ---
 
@@ -58,8 +62,12 @@ Your folder structure should look like this after applying the files:
 
 
 4. Run the script via your terminal:
-
+```bash
 python extract_dat_asset.py
+
+```
+
+
 
 ---
 
