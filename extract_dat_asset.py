@@ -351,7 +351,7 @@ class ExtractorGUI:
     def choose_ndx(self):
         path = filedialog.askopenfilename(
             title="Select the dat.ndx file",
-            filetypes=[("DAT index", "*.ndx"), ("Tous les fichiers", "*.*")]
+            filetypes=[("DAT index", "*.ndx"), ("All files", "*.*")]
         )
         if path:
             self.ndx_var.set(path)
@@ -406,7 +406,10 @@ class ExtractorGUI:
 
         def worker():
             try:
-                result = extract_all(ndx, dat_dir, out_dir, self.messages.put)
+                result = extract_all(
+                    ndx, dat_dir, out_dir,
+                    lambda kind, payload: self.messages.put((kind, payload))
+                )
                 self.messages.put(("done", (result, out_dir)))
             except Exception:
                 self.messages.put(("error", traceback.format_exc()))
