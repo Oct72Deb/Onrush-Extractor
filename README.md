@@ -4,13 +4,13 @@
 
 ---
 
-## 🚀 Status: Fully Functional!
+## Status: Fully Functional!
 
 I am excited to announce that the extraction script is finally up and running! Whether you want to explore the game's internals or help convert Onrush's unique file formats, this tool is your starting point.
 
 ---
 
-## 🛠️ Prerequisites & Requirements
+## Prerequisites & Requirements
 
 Before getting started, make sure you have the following ready:
 
@@ -20,13 +20,12 @@ Before getting started, make sure you have the following ready:
    pip install lz4
 
 3. **Your own legal copy of the game**.
-4. A PKG extraction tool such as **[LibOrbisPkg](https://github.com/maxton/LibOrbisPkg)** (to unpack your PS4 game files initially).
 
 ---
 
-## 📦 Recommended Version (Update 5.00)
+## Recommended Version (Update 5.00)
 
-💡 **Pro-Tip:** It is strongly recommended to extract assets from **Game Version 5.00**, as the game builds were compiled using this specific version.
+**Pro-Tip:** It is strongly recommended to extract assets from **Game Version 5.00**, as the game builds were compiled using this specific version.
 
 ### How to apply Update 5.00 to a Base 1.00 Version:
 
@@ -35,23 +34,23 @@ If you currently have version 1.00 and need to update it to 5.00, simply **drag 
 Your folder structure should look like this after applying the files:
 
 ```text
-📁 YourGameFolder/
-├── 📁 dat/
-├── 📁 data/
-│   └── 📁 dat/
-│       └── 📁 index/
-│           └── 📄 dat.ndx  <-- Target this index file!
-├── 📁 sce_modules/
-├── 📁 sce_sys/
-├── 📄 Project.gp4
-├── 📄 sce_discmap.plt
-└── 📄 sce_discmap_patch.plt
+YourGameFolder/
+├── dat/
+├── data/
+│   └── dat/
+│       └── index/
+│           └── dat.ndx  <-- Target this index file!
+├── sce_modules/
+├── sce_sys/
+├── Project.gp4
+├── sce_discmap.plt
+└── sce_discmap_patch.plt
 
 ```
 
 ---
 
-## ⚙️ Configuration & Usage
+## Configuration & Usage
 
 1. Open the Python script in any text editor of your choice.
 2. **Configure your paths:** Scroll down to the bottom of the script inside the `if __name__ == "__main__":` block.
@@ -71,7 +70,7 @@ python extract_dat_asset.py
 
 ---
 
-## 🤝 Contributing & Community
+## Contributing & Community
 
 The Onrush modding scene might be small, but together we can bring it back from oblivion! Feel free to take this script, improve it, extract assets, and dive into converting those weird proprietary formats.
 
