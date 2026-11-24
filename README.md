@@ -18,8 +18,13 @@ Before getting started, make sure you have the following ready:
 2. The `lz4` python library installed:
    ```bash
    pip install lz4
+   ```
+   And this
+   ```bash
+   pip install pywebview
+   ```
 
-3. **Your own legal copy of the game**.
+4. **Your own legal copy of the game**.
 
 ---
 
