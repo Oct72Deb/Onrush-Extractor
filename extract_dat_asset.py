@@ -1,469 +1,581 @@
 #!/usr/bin/env python3
 """
-Onrush asset extractor - Windows/Linux graphical interface.
+.prf save editor (Onrush / Codemasters profile) - pywebview GUI.
 
-The interface lets you select:
-  - the dat.ndx file;
-  - the folder containing the .dat files;
-  - the output folder.
+Format found by analysis:
+  - file is NOT encrypted: readable schema at the start, values after it
+  - last 8 bytes = MD5(file without those 8 bytes)[:8]  (recomputed on save)
+  - int fields: 04 00 + int32 little-endian
+  - reward flags (Twitch, Dirt, beta...): bools 01 00 vv + BetaRewardTier
+  - unlocked items: 2048-bit bitset (LSB first), bit n = item ID n
 
-Dependency:
-    python -m pip install lz4
+Requires:  pip install pywebview
+Usage:  python onrush_save_editor.py [file.prf]
+        python onrush_save_editor.py --dump file.prf      (no GUI)
+A .bak copy is created next to the file before any write.
+"""
+import hashlib
+import json
+import re
+import shutil
+import struct
+import sys
 
-The extraction preserves the resource folder structure.
+STAT_NAMES = [
+    "StartGame", "OverdriveEvents", "OutrunEvents", "LockdownEvents", "SwitchEvents",
+    "FodderTakedowns", "OpponentTakedowns", "PlayerLevel", "BoostUses", "RushUses",
+    "CampaignsCompleted", "CampaignsUnlocked", "CompleteFirstEvent", "CompleteFinalEvent",
+    "MaxReputation", "EpicBarrelRolls", "CrushingTakedowns", "TombstonesInOneEvent",
+    "TeamProximityCallouts", "CrashTagsUnlocked", "UberTagsUnlocked", "CharactersCustomised",
+    "VehicleClassesCustomised", "CustomisationItemsUnlocked", "SpotlightsAwarded",
+    "TakedownBadges", "WorldTakedownBadges", "CompletedMatchBadges", "NumWrecks", "NumTricks",
+]
+PLAYER_FIELDS = ["CurTotalLevel", "CurLevelTier", "CurLvlXp", "TierXpTgt"]
+LOOT_FIELDS = ["NumLootBoxes", "NormalCurrency", "PremiumCurrency"]
+FLAG_NAMES = [
+    "SeenPreorderOverlay", "SeenDeluxeOverlay", "SeenBetaOverlay", "SeenPremium",
+    "HasTwitchAwards", "HasDirtGameAwards", "HasDirtRallyAwards",
+]
+FLAG_LABELS = {
+    "SeenPreorderOverlay": "Pre-Order Rewards (Special Vortex Buggy)",
+    "SeenDeluxeOverlay": "Deluxe Edition Rewards (Gold Vehicle Designs/Cosmetics + PlayStation Exclusive Designs)",
+    "SeenBetaOverlay": "Beta Rewards",
+    "SeenPremium": "Premium Rewards (Gear Crate Items)",
+    "HasTwitchAwards": "Twitch Rewards",
+    "HasDirtGameAwards": "DiRT Rewards (recent games)",
+    "HasDirtRallyAwards": "DiRT Rally Rewards",
+}
+# Flags shown as checkboxes in the GUI. FLAG_NAMES above stays untouched because its
+# order is the byte layout in the file; hidden flags are simply left as they are on save.
+GUI_FLAGS = ["SeenPreorderOverlay", "SeenBetaOverlay",]
+DELUXE_NOTE = ("Note: " + FLAG_LABELS["SeenDeluxeOverlay"] +
+               " are currently unavailable due to them requiring you to have the DLC installed.")
+PANEL_NOTES = {
+    "profile": "Note: Edit your level, XP, and currency here. BACKUP YOUR SAVE FIRST!",
+    "flags":   DELUXE_NOTE,
+    "stats":   "Note: These are just display numbers and don't change your actual progress.",
+    "items":   "Note: To unlock everything, just click on Unlock Range (0 to 2048). Green boxes are Unlocked items whereas grey ones are Locked.",
+}
+STAT_LABELS = {
+    "StartGame": "Start Game",
+    "OverdriveEvents": "Overdrive Events",
+    "OutrunEvents": "Outrun Events",
+    "LockdownEvents": "Lockdown Events",
+    "SwitchEvents": "Switch Events",
+    "FodderTakedowns": "Fodder Takedowns",
+    "OpponentTakedowns": "Opponent Takedowns",
+    "PlayerLevel": "Player Level",
+    "BoostUses": "Boost Uses",
+    "RushUses": "Rush Uses",
+    "CampaignsCompleted": "Campaigns Completed",
+    "CampaignsUnlocked": "Campaigns Unlocked",
+    "CompleteFirstEvent": "Complete First Event",
+    "CompleteFinalEvent": "Complete Final Event",
+    "MaxReputation": "Max Reputation",
+    "EpicBarrelRolls": "Epic Barrel Rolls",
+    "CrushingTakedowns": "Crushing Takedowns",
+    "TombstonesInOneEvent": "Tombstones In One Event",
+    "TeamProximityCallouts": "Team Proximity Callouts",
+    "CrashTagsUnlocked": "Crash Tags Unlocked",
+    "UberTagsUnlocked": "Uber Tags Unlocked",
+    "CharactersCustomised": "Characters Customised",
+    "VehicleClassesCustomised": "Vehicle Classes Customised",
+    "CustomisationItemsUnlocked": "Customisation Items Unlocked",
+    "SpotlightsAwarded": "Spotlights Awarded",
+    "TakedownBadges": "Takedown Badges",
+    "WorldTakedownBadges": "World Takedown Badges",
+    "CompletedMatchBadges": "Completed Match Badges",
+    "NumWrecks": "Number of Wrecks",
+    "NumTricks": "Number of Tricks",
+}
+PROFILE_LABELS = {
+    "CurTotalLevel": "Total Level (0-1000)",
+    "CurLevelTier": "Level Tier (0-1000)",
+    "CurLvlXp": "Current Level XP (0-100000)",
+    "TierXpTgt": "Tier XP Target (0-20000)",
+    "NumLootBoxes": "Loot Boxes (0-99999)",
+    "NormalCurrency": "Normal Currency (0-99999)",
+    "PremiumCurrency": "Premium Currency (0-99999)",
+}
+N_ITEMS = 2048
+
+
+class Save:
+    def __init__(self, path):
+        self.path = path
+        self.data = bytearray(open(path, "rb").read())
+        self._locate()
+
+    # ---------- locating blocks ----------
+    def _find(self, pattern, label):
+        i = bytes(self.data).find(pattern)
+        if i < 0:
+            raise ValueError(f"Block not found: {label} (file differs from the one analysed?)")
+        return i
+
+    def _locate(self):
+        d = self.data
+        if hashlib.md5(bytes(d[:-8])).digest()[:8] != bytes(d[-8:]):
+            print("Warning: trailing MD5 checksum differs from expected (it will be recomputed).")
+        s = self._find(b"statS\x00\x1e\x00\x04\x00", "Stats")
+        self.stats_off = s + 8
+        p = self._find(b"taDyalP\x00\x14\x00\x04\x00", "PlayerData")
+        self.player_off = p + 10
+        l = self._find(b"ItooL\x00\x05\x00\x00\x01", "Loot")
+        self.new_off = l + 10
+        self.own_off = self.new_off + 256 + 2
+        self.loot_off = self.own_off + 256
+        # reward flags: 7 bools (01 00 vv) then BetaRewardTier (04 00 + int32)
+        v = self._find(b"3vtcejbO\x00\x01\x00\x16\x00\x14\x00", "VideoData")
+        m = re.compile(rb"((?:\x01\x00[\x00\x01]){7})\x04\x00").search(bytes(d), v, v + 120)
+        if not m:
+            raise ValueError("Block not found: reward flags")
+        self.flags_off = m.start(1)
+
+    # ---------- int fields (04 00 + int32) ----------
+    def _get(self, off):
+        assert self.data[off:off + 2] == b"\x04\x00", f"unexpected int entry @ {off}"
+        return struct.unpack_from("<i", self.data, off + 2)[0]
+
+    def _set(self, off, v):
+        assert self.data[off:off + 2] == b"\x04\x00", f"unexpected int entry @ {off}"
+        struct.pack_into("<i", self.data, off + 2, int(v))
+
+    def get_stats(self):
+        return {n: self._get(self.stats_off + 6 * i) for i, n in enumerate(STAT_NAMES)}
+
+    def set_stat(self, name, v):
+        self._set(self.stats_off + 6 * STAT_NAMES.index(name), v)
+
+    def get_player(self):
+        return {n: self._get(self.player_off + 6 * i) for i, n in enumerate(PLAYER_FIELDS)}
+
+    def set_player(self, name, v):
+        self._set(self.player_off + 6 * PLAYER_FIELDS.index(name), v)
+
+    def get_loot(self):
+        return {n: self._get(self.loot_off + 6 * i) for i, n in enumerate(LOOT_FIELDS)}
+
+    def set_loot(self, name, v):
+        self._set(self.loot_off + 6 * LOOT_FIELDS.index(name), v)
+
+    # ---------- reward flags ----------
+    def get_flags(self):
+        f = {n: self.data[self.flags_off + 3 * i + 2] for i, n in enumerate(FLAG_NAMES)}
+        f["BetaRewardTier"] = self._get(self.flags_off + 21)
+        return f
+
+    def set_flag(self, name, v):
+        if name == "BetaRewardTier":
+            self._set(self.flags_off + 21, v)
+        else:
+            self.data[self.flags_off + 3 * FLAG_NAMES.index(name) + 2] = 1 if int(v) else 0
+
+    # ---------- item bitset ----------
+    def owned(self, n):
+        return (self.data[self.own_off + n // 8] >> (n % 8)) & 1
+
+    def set_owned(self, n, state):
+        o = self.own_off + n // 8
+        if state:
+            self.data[o] |= 1 << (n % 8)
+        else:
+            self.data[o] &= ~(1 << (n % 8)) & 0xFF
+
+    def owned_count(self):
+        return sum(self.owned(n) for n in range(N_ITEMS))
+
+    # ---------- writing ----------
+    def save(self, path=None):
+        path = path or self.path
+        self.data[-8:] = hashlib.md5(bytes(self.data[:-8])).digest()[:8]
+        try:
+            shutil.copyfile(path, path + ".bak")
+        except FileNotFoundError:
+            pass
+        open(path, "wb").write(bytes(self.data))
+
+
+def dump(path):
+    s = Save(path)
+    print("== Profile ==", s.get_player())
+    print("== Loot ==", s.get_loot())
+    print("== Rewards ==", s.get_flags())
+    print(f"== Unlocked items: {s.owned_count()}/{N_ITEMS}")
+    print("   IDs:", [n for n in range(N_ITEMS) if s.owned(n)])
+    print("== Stats ==")
+    for k, v in s.get_stats().items():
+        print(f"   {k:28s} {v}")
+
+
+# ======================= GUI (pywebview) =======================
+HTML = r"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Onrush Save Editor</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f0f0f0; --fg: #1a1a1a; --border: #aaa;
+    --btn-bg: #e1e1e1; --btn-hover: #d4d4d4;
+    --input-bg: #fff; --tab-active: #fff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #2b2b2b; --fg: #e6e6e6; --border: #555;
+      --btn-bg: #3c3c3c; --btn-hover: #4a4a4a;
+      --input-bg: #1e1e1e; --tab-active: #333;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 13px "Segoe UI", system-ui, sans-serif; background: var(--bg); color: var(--fg);
+         display: flex; flex-direction: column; height: 100vh; }
+  #top { display: flex; align-items: center; gap: 6px; padding: 8px; }
+  #status { margin-left: auto; opacity: .85; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%; }
+  button { padding: 4px 12px; border: 1px solid var(--border); background: var(--btn-bg); color: var(--fg);
+           border-radius: 3px; cursor: pointer; font: inherit; }
+  button:hover { background: var(--btn-hover); }
+  input[type=text] { padding: 3px 5px; border: 1px solid var(--border); background: var(--input-bg);
+                     color: var(--fg); border-radius: 2px; font: inherit; }
+  #tabbar { display: flex; gap: 2px; padding: 0 8px; border-bottom: 1px solid var(--border); }
+  .tab { padding: 5px 14px; border: 1px solid transparent; border-bottom: none; cursor: pointer; border-radius: 3px 3px 0 0; }
+  .tab.active { background: var(--tab-active); border-color: var(--border); position: relative; top: 1px; }
+  .panel-note { margin-top: 18px; padding: 8px 10px; border-top: 1px solid var(--border); font-size: 12px; opacity: .85; }
+  .panel-note:empty { display: none; }
+  .panel { display: none; }
+  .panel.active { display: block; }
+  .form { display: grid; grid-auto-flow: column; grid-template-rows: repeat(15, auto);
+          justify-content: start; column-gap: 24px; row-gap: 4px; align-items: center; }
+  .form .row { display: flex; align-items: center; }
+  .form .row label { width: 190px; padding: 0 8px; }
+  .form .row input { width: 110px; }
+  .flags label { display: block; padding: 4px 10px; }
+  #items-info { margin: 4px 0; }
+  #grid { background: #222; display: block; cursor: pointer; margin: 0 0 6px 0; }
+  .bar { display: flex; align-items: center; gap: 6px; padding: 6px 0; }
+  .bar input { width: 55px; }
+  #toast { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%); padding: 8px 16px;
+           border-radius: 4px; color: #fff; display: none; max-width: 80%; z-index: 10; }
+  #toast.ok { background: #2e7d32; }
+  #toast.err { background: #c62828; }
+  #app-footer {
+    text-align: center;
+    padding: 8px;
+    font-size: 11px;
+    color: var(--fg);
+    opacity: 0.6;
+    border-top: 1px solid var(--border);
+    background: var(--bg);
+    user-select: none;
+  }
+</style>
+</head>
+<body>
+<div id="top">
+  <button id="btn-open">Open file...</button>
+  <button id="btn-save">Save and Apply</button>
+  <span id="status">No file open</span>
+</div>
+<div id="tabbar">
+  <div class="tab active" data-tab="profile">Level / Currency</div>
+  <div class="tab" data-tab="flags">Rewards</div>
+  <div class="tab" data-tab="stats">Stats</div>
+  <div class="tab" data-tab="items">Items / Skins</div>
+</div>
+<div id="panels">
+  <div class="panel active" id="panel-profile">
+    <div class="form" id="form-profile"></div>
+    <div class="panel-note" id="note-profile"></div>
+  </div>
+  <div class="panel" id="panel-flags">
+    <div class="flags" id="flags-list"></div>
+    <div class="panel-note" id="note-flags"></div>
+  </div>
+  <div class="panel" id="panel-stats">
+    <div class="form" id="form-stats"></div>
+    <div class="panel-note" id="note-stats"></div>
+  </div>
+  <div class="panel" id="panel-items">
+    <div id="items-info"></div>
+    <canvas id="grid"></canvas>
+    <div class="bar">
+      <span>From ID</span><input type="text" id="r-from" value="0">
+      <span>to ID</span><input type="text" id="r-to" value="2048">
+      <button id="btn-unlock">Unlock range</button>
+      <button id="btn-lock">Lock range</button>
+    </div>
+    <div class="panel-note" id="note-items"></div>
+  </div>
+</div>
+<div id="app-footer">
+  Created by Nanza & Daemon | Project Rusher | Version 2.0 | 2026
+</div>
+<div id="toast"></div>
+
+<script>
+const CELL = 14, COLS = 64;
+let schema = null;
+let owned = new Uint8Array(2048);
+let loaded = false;
+const inputs = {};   // name -> input element (player, loot, stats)
+const flagBoxes = {};
+
+function toast(msg, ok) {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.className = ok ? "ok" : "err";
+  t.style.display = "block";
+  clearTimeout(toast._h);
+  toast._h = setTimeout(() => t.style.display = "none", ok ? 2500 : 6000);
+}
+
+function buildForm(container, names, labels = {}) {
+  names.forEach(name => {
+    const row = document.createElement("div");
+    row.className = "row";
+    const lab = document.createElement("label");
+    lab.textContent = labels[name] || name;
+    const inp = document.createElement("input");
+    inp.type = "text";
+    row.appendChild(lab);
+    row.appendChild(inp);
+    container.appendChild(row);
+    inputs[name] = inp;
+  });
+}
+
+// ---- items canvas ----
+const canvas = document.getElementById("grid");
+const ctx = canvas.getContext("2d");
+function sizeCanvas() {
+  canvas.width = COLS * CELL;
+  canvas.height = (schema.n_items / COLS) * CELL;
+}
+function drawCell(n) {
+  const x = (n % COLS) * CELL, y = Math.floor(n / COLS) * CELL;
+  ctx.fillStyle = owned[n] ? "#3fb950" : "#444";
+  ctx.fillRect(x, y, CELL - 1, CELL - 1);
+}
+function drawAll() {
+  ctx.fillStyle = "#222";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  for (let n = 0; n < schema.n_items; n++) drawCell(n);
+}
+function count() { let c = 0; for (let i = 0; i < owned.length; i++) c += owned[i]; return c; }
+function setInfoDefault() {
+  document.getElementById("items-info").textContent =
+    `${count()}/${schema.n_items} items unlocked (green = owned). Click to toggle.`;
+}
+
+canvas.addEventListener("click", async ev => {
+  if (!loaded) return;
+  const r = canvas.getBoundingClientRect();
+  const x = ev.clientX - r.left, y = ev.clientY - r.top;
+  const n = Math.floor(y / CELL) * COLS + Math.floor(x / CELL);
+  if (n >= 0 && n < schema.n_items) {
+    const res = await pywebview.api.toggle_item(n);
+    owned[n] = res.owned ? 1 : 0;
+    drawCell(n);
+    document.getElementById("items-info").textContent =
+      `Item ${n} -> ${res.owned ? "unlocked" : "locked"} | ${res.count}/${schema.n_items}`;
+  }
+});
+
+async function setRange(val) {
+  if (!loaded) return;
+  const res = await pywebview.api.set_range(
+    document.getElementById("r-from").value,
+    document.getElementById("r-to").value, val);
+  if (res.error) { toast(res.error, false); return; }
+  owned = Uint8Array.from(res.owned);
+  drawAll();
+  setInfoDefault();
+}
+document.getElementById("btn-unlock").onclick = () => setRange(1);
+document.getElementById("btn-lock").onclick = () => setRange(0);
+
+// ---- file handling ----
+function applyLoaded(res) {
+  if (res.error) { toast(res.error, false); return; }
+  if (res.cancelled) return;
+  loaded = true;
+  for (const k in res.player) inputs[k].value = res.player[k];
+  for (const k in res.loot) inputs[k].value = res.loot[k];
+  for (const k in res.stats) inputs[k].value = res.stats[k];
+  schema.flag_names.forEach(k => flagBoxes[k].checked = !!res.flags[k]);
+  owned = Uint8Array.from(res.owned);
+  drawAll();
+  setInfoDefault();
+  document.getElementById("status").textContent = res.path;
+}
+
+document.getElementById("btn-open").onclick = async () => applyLoaded(await pywebview.api.open_file());
+
+document.getElementById("btn-save").onclick = async () => {
+  if (!loaded) return;
+  
+  // Note: Removed "tier: document.getElementById("tier").value"
+  const vals = { player: {}, loot: {}, stats: {}, flags: {} };
+  
+  schema.player_fields.forEach(k => vals.player[k] = inputs[k].value);
+  schema.loot_fields.forEach(k => vals.loot[k] = inputs[k].value);
+  schema.stat_names.forEach(k => vals.stats[k] = inputs[k].value);
+  schema.flag_names.forEach(k => vals.flags[k] = flagBoxes[k].checked ? 1 : 0);
+  
+  // NEW: Automatically forces 999 if checked, or 0 if unchecked
+  vals.tier = flagBoxes["SeenBetaOverlay"].checked ? 999 : 0;
+
+  const res = await pywebview.api.save_file(vals);
+  if (res.error) toast(res.error, false);
+  else toast("Changes applied and Save file updated (A backup copy of the original save file was created, checksum recomputed).", true);
+};
+
+// ---- tabs ----
+document.querySelectorAll(".tab").forEach(t => t.onclick = () => {
+  document.querySelectorAll(".tab").forEach(x => x.classList.toggle("active", x === t));
+  document.querySelectorAll(".panel").forEach(p => p.classList.toggle("active", p.id === "panel-" + t.dataset.tab));
+});
+
+// ---- init ----
+window.addEventListener("pywebviewready", async () => {
+  schema = await pywebview.api.get_schema();
+  buildForm(document.getElementById("form-profile"), schema.player_fields.concat(schema.loot_fields), schema.profile_labels);
+  buildForm(document.getElementById("form-stats"), schema.stat_names, schema.stat_labels);
+  const fl = document.getElementById("flags-list");
+  schema.flag_names.forEach(name => {
+    const lab = document.createElement("label");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    lab.appendChild(cb);
+    lab.appendChild(document.createTextNode(`  ${schema.flag_labels[name]}`));
+    fl.appendChild(lab);
+    flagBoxes[name] = cb;
+  });
+  for (const [tab, note] of Object.entries(schema.panel_notes)) {
+    const el = document.getElementById("note-" + tab);
+    if (el) el.textContent = note;
+  }
+  sizeCanvas();
+  drawAll();
+  setInfoDefault();
+  const init = await pywebview.api.get_initial();
+  if (init) applyLoaded(init);
+});
+</script>
+</body>
+</html>
 """
 
-import struct
-import traceback
-import threading
-import queue
-from pathlib import Path
-from dataclasses import dataclass
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
 
-try:
-    import lz4.block
-except ImportError:
-    lz4 = None
-
-
-# ---------------------------------------------------------------------
-# DAT index reader
-# ---------------------------------------------------------------------
-
-CHUNK_ENTRY_SIZE = 12
-CHUNK_ENTRY_FMT = "<III"
-
-RES_OFF_NAME = 0x00
-RES_OFF_TOTAL_SIZE = 0x18
-RES_OFF_FIRST_CHUNK_IDX = 0x1C
-RES_OFF_BASE_OFFSET = 0x20
-
-
-@dataclass
-class ChunkEntry:
-    dat_file_id: int
-    offset: int
-    raw_size: int
-
-
-@dataclass
-class ResourceDesc:
-    name: str
-    first_chunk_index: int
-    base_offset: int
-    chunk_size: int
-    total_size: int
-
-
-@dataclass
-class DatNdxHeader:
-    num_resources: int
-    num_chunks: int
-    chunk_size: int
-    num_filenames: int
-    string_blob_size: int
-
-    RESOURCE_ENTRY_SIZE = 0x38
-    FILENAME_ENTRY_SIZE = 8
-    HEADER_SIZE = 0x30
-
-    OFF_NUM_RESOURCES = 0x1C - 0x10
-    OFF_NUM_CHUNKS = 0x20 - 0x10
-    OFF_CHUNK_SIZE = 0x24 - 0x10
-    OFF_NUM_FILENAMES = 0x30 - 0x10
-    OFF_STRING_BLOB_SIZE = 0x38 - 0x10
-
-    @classmethod
-    def from_bytes(cls, data: bytes):
-        if len(data) < cls.HEADER_SIZE:
-            raise ValueError("The dat.ndx file is too small or invalid.")
-
-        return cls(
-            struct.unpack_from("<I", data, cls.OFF_NUM_RESOURCES)[0],
-            struct.unpack_from("<I", data, cls.OFF_NUM_CHUNKS)[0],
-            struct.unpack_from("<I", data, cls.OFF_CHUNK_SIZE)[0],
-            struct.unpack_from("<I", data, cls.OFF_NUM_FILENAMES)[0],
-            struct.unpack_from("<Q", data, cls.OFF_STRING_BLOB_SIZE)[0],
-        )
-
-
-def load_dat_ndx(dat_ndx_path: Path):
-    data = dat_ndx_path.read_bytes()
-    pos = 0
-
-    header = DatNdxHeader.from_bytes(data[:DatNdxHeader.HEADER_SIZE])
-    pos += DatNdxHeader.HEADER_SIZE
-
-    resource_entries_raw = []
-    for _ in range(header.num_resources):
-        entry = data[pos:pos + DatNdxHeader.RESOURCE_ENTRY_SIZE]
-        if len(entry) != DatNdxHeader.RESOURCE_ENTRY_SIZE:
-            raise ValueError("Resource table is truncated in dat.ndx.")
-        resource_entries_raw.append(entry)
-        pos += DatNdxHeader.RESOURCE_ENTRY_SIZE
-
-    chunk_table = []
-    for _ in range(header.num_chunks):
-        if pos + CHUNK_ENTRY_SIZE > len(data):
-            raise ValueError("Chunk table is truncated in dat.ndx.")
-        dat_file_id, offset, raw_size = struct.unpack_from(CHUNK_ENTRY_FMT, data, pos)
-        chunk_table.append(ChunkEntry(dat_file_id, offset, raw_size))
-        pos += CHUNK_ENTRY_SIZE
-
-    filename_offsets = []
-    for _ in range(header.num_filenames):
-        if pos + DatNdxHeader.FILENAME_ENTRY_SIZE > len(data):
-            raise ValueError("Filename table is truncated in dat.ndx.")
-        filename_offsets.append(struct.unpack_from("<i", data, pos)[0])
-        pos += DatNdxHeader.FILENAME_ENTRY_SIZE
-
-    string_blob = data[pos:pos + header.string_blob_size]
-    if len(string_blob) != header.string_blob_size:
-        raise ValueError("String block is incomplete in dat.ndx.")
-
-    def read_cstr(blob: bytes, offset: int) -> str:
-        if offset < 0 or offset >= len(blob):
-            raise ValueError(f"Invalid string offset: {offset}")
-        end = blob.find(b"\x00", offset)
-        if end == -1:
-            raise ValueError("Unterminated string in dat.ndx.")
-        return blob[offset:end].decode("utf-8", errors="replace")
-
-    filenames = [read_cstr(string_blob, off) for off in filename_offsets]
-    resource_names = [
-        read_cstr(string_blob, struct.unpack_from("<i", entry, RES_OFF_NAME)[0])
-        for entry in resource_entries_raw
-    ]
-
-    return header, resource_entries_raw, resource_names, chunk_table, filenames
-
-
-def entry_to_resource(entry: bytes, name: str, chunk_size: int) -> ResourceDesc:
-    return ResourceDesc(
-        name=name,
-        first_chunk_index=struct.unpack_from("<I", entry, RES_OFF_FIRST_CHUNK_IDX)[0],
-        base_offset=struct.unpack_from("<I", entry, RES_OFF_BASE_OFFSET)[0],
-        chunk_size=chunk_size,
-        total_size=struct.unpack_from("<I", entry, RES_OFF_TOTAL_SIZE)[0],
-    )
-
-
-class DatFileCache:
-    def __init__(self, dat_dir: Path, filenames: list[str]):
-        self.dat_dir = dat_dir
-        self.filenames = filenames
-        self._handles = {}
-
-    def read(self, dat_file_id: int, offset: int, size: int) -> bytes:
-        if dat_file_id < 0 or dat_file_id >= len(self.filenames):
-            raise IndexError(f"Invalid .dat file ID: {dat_file_id}")
-
-        fh = self._handles.get(dat_file_id)
-        if fh is None:
-            dat_name = self.filenames[dat_file_id]
-            path = self.dat_dir / f"{dat_name}.dat"
-            if not path.is_file():
-                raise FileNotFoundError(f"DAT file not found: {path}")
-            fh = open(path, "rb")
-            self._handles[dat_file_id] = fh
-
-        fh.seek(offset)
-        data = fh.read(size)
-        if len(data) != size:
-            raise IOError(
-                f"Incomplete read from {self.filenames[dat_file_id]}.dat "
-                f"(expected {size} bytes, received {len(data)})."
-            )
-        return data
-
-    def close_all(self):
-        for fh in self._handles.values():
-            fh.close()
-        self._handles.clear()
-
-
-def extract_resource(chunk_table, resource: ResourceDesc, dat_cache: DatFileCache) -> bytes:
-    output = bytearray()
-    remaining = resource.total_size
-    pos = resource.base_offset
-
-    if resource.chunk_size <= 0:
-        raise ValueError("Invalid chunk size in dat.ndx.")
-
-    while remaining > 0:
-        block_index = pos // resource.chunk_size
-        chunk_index = block_index + resource.first_chunk_index
-        offset_in_chunk = pos - block_index * resource.chunk_size
-
-        if chunk_index < 0 or chunk_index >= len(chunk_table):
-            raise IndexError(f"Invalid chunk index: {chunk_index}")
-
-        entry = chunk_table[chunk_index]
-        raw_chunk = dat_cache.read(entry.dat_file_id, entry.offset, entry.raw_size)
-        decompressed = lz4.block.decompress(
-            raw_chunk, uncompressed_size=resource.chunk_size
-        )
-
-        available = len(decompressed) - offset_in_chunk
-        if available <= 0:
-            raise ValueError("Decompressed chunk is too small for this resource.")
-
-        take = min(remaining, available)
-        output += decompressed[offset_in_chunk:offset_in_chunk + take]
-        pos += take
-        remaining -= take
-
-    return bytes(output)
-
-
-def resource_output_path(out_dir: Path, name: str) -> Path:
-    # Prevents a resource name from escaping the output folder.
-    clean = name.replace(":", "/").replace("\\", "/")
-    parts = [p for p in clean.split("/") if p not in ("", ".", "..")]
-    if not parts:
-        raise ValueError(f"Invalid resource name: {name!r}")
-    return out_dir.joinpath(*parts)
-
-
-def extract_all(dat_ndx_path: Path, dat_dir: Path, out_dir: Path, report):
-    if lz4 is None:
-        raise RuntimeError(
-            "The Python 'lz4' module is not installed.\n"
-            "Open a terminal and run: python -m pip install lz4"
-        )
-
-    header, entries, names, chunks, filenames = load_dat_ndx(dat_ndx_path)
-    if header.chunk_size <= 0:
-        raise ValueError("Invalid chunk size in dat.ndx.")
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    cache = DatFileCache(dat_dir, filenames)
-
-    total = len(entries)
-    ok = skipped = failed = 0
-    failures = []
-
-    try:
-        for index, (entry, name) in enumerate(zip(entries, names), start=1):
-            try:
-                if name.endswith(("/", ":")) or name == ".":
-                    skipped += 1
-                else:
-                    resource = entry_to_resource(entry, name, header.chunk_size)
-                    if resource.total_size == 0:
-                        skipped += 1
-                    else:
-                        destination = resource_output_path(out_dir, name)
-                        if destination.exists() and destination.stat().st_size == resource.total_size:
-                            skipped += 1
-                        else:
-                            destination.parent.mkdir(parents=True, exist_ok=True)
-                            destination.write_bytes(extract_resource(chunks, resource, cache))
-                            ok += 1
-            except Exception as exc:
-                failed += 1
-                failures.append(f"{name}: {exc}")
-
-            if index % 25 == 0 or index == total:
-                report("progress", (index, total, ok, skipped, failed))
-
-    finally:
-        cache.close_all()
-
-    if failures:
-        (out_dir / "_failures.txt").write_text(
-            "\n\n".join(failures), encoding="utf-8"
-        )
-
-    return ok, skipped, failed, total
-
-
-# ---------------------------------------------------------------------
-# Graphical interface
-# ---------------------------------------------------------------------
-
-class ExtractorGUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Onrush DAT Extractor")
-        self.root.geometry("760x530")
-        self.root.minsize(650, 470)
-        self.messages = queue.Queue()
-        self.running = False
-
-        main = ttk.Frame(root, padding=16)
-        main.pack(fill="both", expand=True)
-        main.columnconfigure(1, weight=1)
-        main.rowconfigure(7, weight=1)
-
-        ttk.Label(main, text="Onrush DAT Extractor", font=("Segoe UI", 17, "bold")).grid(
-            row=0, column=0, columnspan=3, sticky="w", pady=(0, 4)
-        )
-        ttk.Label(
-            main,
-            text="Select the game files and the folder where you want to extract the resources."
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 16))
-
-        self.ndx_var = tk.StringVar()
-        self.dat_var = tk.StringVar()
-        self.out_var = tk.StringVar()
-
-        self._path_row(main, 2, "dat.ndx file", self.ndx_var, self.choose_ndx)
-        self._path_row(main, 3, "Folder containing .dat files", self.dat_var, self.choose_dat_dir)
-        self._path_row(main, 4, "Output folder", self.out_var, self.choose_out_dir)
-
-        self.start_button = ttk.Button(main, text="Start extraction", command=self.start)
-        self.start_button.grid(row=5, column=0, sticky="w", pady=(14, 8))
-
-        self.progress = ttk.Progressbar(main, mode="determinate")
-        self.progress.grid(row=5, column=1, columnspan=2, sticky="ew", padx=(12, 0), pady=(14, 8))
-
-        self.status_var = tk.StringVar(value="Ready.")
-        ttk.Label(main, textvariable=self.status_var).grid(
-            row=6, column=0, columnspan=3, sticky="w", pady=(0, 6)
-        )
-
-        self.log = tk.Text(main, height=12, wrap="word", state="disabled")
-        self.log.grid(row=7, column=0, columnspan=3, sticky="nsew")
-        scrollbar = ttk.Scrollbar(main, orient="vertical", command=self.log.yview)
-        scrollbar.grid(row=7, column=3, sticky="ns")
-        self.log.configure(yscrollcommand=scrollbar.set)
-
-        ttk.Label(
-            main,
-            text="Required dependency: python -m pip install lz4",
-            foreground="#666666"
-        ).grid(row=8, column=0, columnspan=3, sticky="w", pady=(10, 0))
-
-        self.root.after(100, self.process_messages)
-
-    def _path_row(self, parent, row, label, variable, command):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=5)
-        ttk.Entry(parent, textvariable=variable).grid(
-            row=row, column=1, sticky="ew", padx=10, pady=5
-        )
-        ttk.Button(parent, text="Parcourir…", command=command).grid(
-            row=row, column=2, sticky="ew", pady=5
-        )
-
-    def choose_ndx(self):
-        path = filedialog.askopenfilename(
-            title="Select the dat.ndx file",
-            filetypes=[("DAT index", "*.ndx"), ("All files", "*.*")]
-        )
-        if path:
-            self.ndx_var.set(path)
-            if not self.dat_var.get():
-                self.dat_var.set(str(Path(path).parent))
-
-    def choose_dat_dir(self):
-        path = filedialog.askdirectory(title="Folder containing .dat files")
-        if path:
-            self.dat_var.set(path)
-
-    def choose_out_dir(self):
-        path = filedialog.askdirectory(title="Output folder")
-        if path:
-            self.out_var.set(path)
-
-    def write_log(self, message):
-        self.log.configure(state="normal")
-        self.log.insert("end", message + "\n")
-        self.log.see("end")
-        self.log.configure(state="disabled")
-
-    def start(self):
-        if self.running:
-            return
-
-        ndx = Path(self.ndx_var.get()).expanduser()
-        dat_dir = Path(self.dat_var.get()).expanduser()
-        out_dir = Path(self.out_var.get()).expanduser()
-
-        if not ndx.is_file():
-            messagebox.showerror("Missing file", "Please select a valid dat.ndx file.")
-            return
-        if not dat_dir.is_dir():
-            messagebox.showerror("Missing folder", "Please select the folder containing the .dat files.")
-            return
-        if not self.out_var.get().strip():
-            messagebox.showerror("Missing output folder", "Please select an output folder.")
-            return
-        if lz4 is None:
-            messagebox.showerror(
-                "Missing module",
-                "The lz4 module is not installed.\n\n"
-                "Open PowerShell or a terminal and run:\npython -m pip install lz4"
-            )
-            return
-
-        self.running = True
-        self.start_button.configure(state="disabled")
-        self.progress["value"] = 0
-        self.write_log("Starting extraction…")
-
-        def worker():
-            try:
-                result = extract_all(
-                    ndx, dat_dir, out_dir,
-                    lambda kind, payload: self.messages.put((kind, payload))
-                )
-                self.messages.put(("done", (result, out_dir)))
-            except Exception:
-                self.messages.put(("error", traceback.format_exc()))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def process_messages(self):
+class Api:
+    """Bridge between the web UI and the Save class (underscore attrs are not exposed to JS)."""
+
+    def __init__(self, initial=None):
+        self._save = None
+        self._initial = initial
+        self._window = None
+
+    def get_schema(self):
+        return {
+            "player_fields": PLAYER_FIELDS,
+            "loot_fields": LOOT_FIELDS,
+            "stat_names": STAT_NAMES,
+            "flag_names": GUI_FLAGS,
+            "flag_labels": FLAG_LABELS,
+            "deluxe_note": DELUXE_NOTE,
+            "panel_notes": PANEL_NOTES,      
+            "stat_labels": STAT_LABELS,
+            "profile_labels": PROFILE_LABELS,
+            "n_items": N_ITEMS,
+        }
+
+    def _payload(self):
+        s = self._save
+        return {
+            "path": s.path,
+            "player": s.get_player(),
+            "loot": s.get_loot(),
+            "stats": s.get_stats(),
+            "flags": s.get_flags(),
+            "owned": [s.owned(n) for n in range(N_ITEMS)],
+        }
+
+    def _load(self, path):
         try:
-            while True:
-                kind, payload = self.messages.get_nowait()
-                if kind == "progress":
-                    current, total, ok, skipped, failed = payload
-                    self.progress["maximum"] = max(total, 1)
-                    self.progress["value"] = current
-                    self.status_var.set(
-                        f"{current:,}/{total:,} | Extracted: {ok:,} | Skipped: {skipped:,} | Errors: {failed:,}"
-                    )
-                elif kind == "done":
-                    result, out_dir = payload
-                    ok, skipped, failed, total = result
-                    self.running = False
-                    self.start_button.configure(state="normal")
-                    self.status_var.set("Extraction complete.")
-                    self.write_log(
-                        f"Done: {ok} extracted, {skipped} skipped, {failed} errors."
-                    )
-                    if failed:
-                        self.write_log(f"Error details are saved in: {out_dir / '_failures.txt'}")
-                    messagebox.showinfo(
-                        "Extraction complete",
-                        f"Files extracted: {ok}\nSkipped: {skipped}\nErrors: {failed}\n\n"
-                        f"Output: {out_dir}"
-                    )
-                elif kind == "error":
-                    self.running = False
-                    self.start_button.configure(state="normal")
-                    self.status_var.set("Error.")
-                    self.write_log(payload)
-                    messagebox.showerror("Extraction error", payload.splitlines()[-1])
-        except queue.Empty:
-            pass
+            s = Save(path)
+            self._save = s
+            return self._payload()
+        except Exception as e:
+            return {"error": str(e)}
 
-        self.root.after(100, self.process_messages)
+    def get_initial(self):
+        if self._initial:
+            return self._load(self._initial)
+        return None
+
+    def open_file(self):
+        import webview
+        dialog_type = webview.FileDialog.OPEN if hasattr(webview, "FileDialog") else webview.OPEN_DIALOG
+        r = self._window.create_file_dialog(
+            dialog_type, file_types=("Profile (*.prf)", "All files (*.*)"))
+        if not r:
+            return {"cancelled": True}
+        path = r[0] if isinstance(r, (list, tuple)) else r
+        return self._load(path)
+
+    def toggle_item(self, n):
+        s = self._save
+        n = int(n)
+        if not s or not (0 <= n < N_ITEMS):
+            return {"owned": False, "count": 0}
+        s.set_owned(n, not s.owned(n))
+        return {"owned": bool(s.owned(n)), "count": s.owned_count()}
+
+    def set_range(self, lo, hi, val):
+        s = self._save
+        if not s:
+            return {"error": "No file open"}
+        try:
+            lo, hi = int(lo), int(hi)
+        except Exception as e:
+            return {"error": str(e)}
+        for n in range(max(0, lo), min(N_ITEMS - 1, hi) + 1):
+            s.set_owned(n, int(val))
+        return {"owned": [s.owned(n) for n in range(N_ITEMS)]}
+
+    def save_file(self, vals):
+        s = self._save
+        if not s:
+            return {"error": "No file open"}
+        try:
+            for k in PLAYER_FIELDS:
+                s.set_player(k, vals["player"][k])
+            for k in LOOT_FIELDS:
+                s.set_loot(k, vals["loot"][k])
+            for k in STAT_NAMES:
+                s.set_stat(k, vals["stats"][k])
+            for k in GUI_FLAGS:
+                s.set_flag(k, vals["flags"][k])
+            s.set_flag("BetaRewardTier", vals["tier"])
+            s.save()
+        except Exception as e:
+            return {"error": str(e)}
+        return {"ok": True}
 
 
-def main():
-    root = tk.Tk()
-    try:
-        ttk.Style().theme_use("vista")
-    except tk.TclError:
-        pass
-    ExtractorGUI(root)
-    root.mainloop()
+def run_gui(initial=None):
+    import webview
+
+    api = Api(initial)
+    window = webview.create_window("Onrush Save Editor", html=HTML, js_api=api,
+                                   width=1011, height=677)
+    api._window = window
+    webview.start(icon='app.ico')
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) >= 3 and sys.argv[1] == "--dump":
+        dump(sys.argv[2])
+    else:
+        run_gui(sys.argv[1] if len(sys.argv) > 1 else None)
